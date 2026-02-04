@@ -1,0 +1,797 @@
+---
+title: "projet inflation Senegal"
+author: "Hadidja Ahamada Soyad"
+date: "2026-01-15"
+output:
+  html_document: default
+  pdf_document: default
+---
+# ======================================================
+# PROJET : Analyse de séries temporelles macroéconomiques
+# Langage : R
+# Objectif :
+# 1) Transformer les données en séries temporelles
+# 2) Analyse descriptive : tendance, saisonnalité, fluctuations
+# 3) Tests de stationnarité
+# 4) Tests de cointégration de johasen
+# 5) Estimation du modèle VAR explicatif
+# ======================================================
+## Importation des packages nécéssaire 
+```{r}
+library(tidyverse)
+library(dplyr)
+library(lubridate)
+library(tsibble)
+library(forecast)
+library(tseries)
+library(readxl)
+library(fpp3)
+library(feasts)
+library(urca)
+library(vars)
+library(randomForest)
+library(xgboost)
+library(dynlm)
+```
+
+ 
+## 1. Importation des données
+```{r}
+setwd("D:/Hadidja/Econometrie/data")
+data <- read_xlsx("donnees_inflation.xlsx")
+
+# Supréssion des variables 
+data <- data[-1, ] %>%
+  dplyr::select(-IPPI, -IHPC, -PFOODINDEXM, -PNRGINDEXM, -IHPI, -taux_directeur)  
+head(data)
+```
+
+
+```{r}
+# Importation de la base de données taux_directeur
+setwd("D:/Hadidja/Econometrie/data")
+taux_directeur <- read_xlsx("taux_directeur.xlsx" )
+head(taux_directeur)
+
+# Compiler les données avec jointure
+
+data <- data %>%
+  left_join(
+    taux_directeur %>%  dplyr::select(periode, Taux_moyen_mensuel),
+    by = "periode"
+  ) %>% rename(taux_directeur =Taux_moyen_mensuel )
+head(data)
+```
+
+
+```{r}
+# Séléction des variables pertinente 
+data <- data %>% dplyr:: select( "periode" , "inflation", "Importations",
+                    "masse_monetaireM2","Taux_change_usd","taux_directeur")
+```
+
+```{r}
+data_ts <- data %>%
+  mutate(periode = yearmonth("2017-01") + 0:95) %>%
+  as_tsibble(index = periode)  
+data_ts
+```
+
+
+```{r}
+# 3 . Mise en forme de la variable temps
+# ==============================
+
+data_ts <- data %>%
+  mutate(
+    # as_date() extrait uniquement la partie date "2017-01-01" 
+    # et supprime les heures/minutes/secondes
+    periode = as_date(periode) 
+  ) %>%
+  # On convertit ensuite en format mensuel tsibble pour les analyses
+  mutate(periode = yearmonth(periode))  %>%
+  as_tsibble(index = periode)
+```
+
+
+```{r}
+#==============================================================================
+#                          4.   ANALYSE DESCRIPTIVE
+# =============================
+# 1 .Analyse descriptive graphique autoplot
+# ==============================
+
+##   Évolution globale (tendance visuelle)
+vars_num <- names(data_ts)[names(data_ts) != "periode"]
+for (var in vars_num) {
+  
+  p <- data_ts %>%
+    autoplot(.data[[var]]) +
+    labs(
+      title = paste("Tendance de", var),
+      x = "Année",
+      y = var
+    ) +
+    theme_minimal()
+  
+  print(p)
+}
+```
+
+
+```{r}
+## 4.2 Décomposition STL 
+vars_num <- names(data_ts)[names(data_ts) != "periode"]
+stl_plot <- function(data, var) {
+  
+  ts_var <- ts(
+    data[[var]],
+    start = c(year(min(data$periode)), month(min(data$periode))),
+    frequency = 12
+  )
+  
+  fit_stl <- stl(ts_var, s.window = "periodic")
+  
+  autoplot(fit_stl) +
+    labs(
+      title = paste("Décomposition STL de", var),
+      x = "Année"
+    ) +
+    theme_minimal()
+}
+
+for (var in vars_num) {
+  print(stl_plot(data_ts, var))}
+```
+
+
+```{r}
+# ==============================
+# 2. Analyse de la saisonnalité
+# ==============================
+vars_saison <- names(data_ts)[names(data_ts) != "periode"]
+
+for (var in vars_saison) {
+  
+  # 1. Extraire periode + variable
+  tmp <- data_ts %>% dplyr:: select(periode, value = all_of(var)) %>%
+    filter(!is.na(value))
+  
+  # 2. Sécurité : assez d'observations ?
+  if (nrow(tmp) < 12) {
+    message("Variable ignorée (données insuffisantes) : ", var)
+    next
+  }
+  
+  # 3. Création de la série temporelle
+  ts_var <- ts(
+    tmp$value,
+    start = c(
+      year(min(tmp$periode)),
+      month(min(tmp$periode))
+    ),
+    frequency = 12
+  )
+  
+  # 4. Graphique saisonnier
+  p <- ggseasonplot(
+    ts_var,
+    year.labels = TRUE,
+    year.labels.left = TRUE
+  ) +
+    labs(
+      title = paste("Graphique saisonnier de", var),
+      x = "Mois",
+      y = var
+    ) +
+    theme_minimal()
+  
+  print(p)
+  }
+```
+
+```{r}
+# ==============================
+# 3. Analyse des relations
+# ==============================
+GGally::ggpairs(as.data.frame(data_ts[,2:5]))
+```
+
+
+ 
+```{r}
+## ACF et PACF
+# On utilise les fonctions de base (stats) qui sont insensibles aux "gaps"
+for (var in vars_num) {
+  
+  # 1. Vérifier si la variable existe et a des données
+  if (var %in% colnames(data_ts)) {
+    
+    # Extraire les données en enlevant les NA pour le calcul
+    y <- na.omit(as.numeric(data_ts[[var]]))
+    
+    if (length(y) > 0) {
+      # Créer une zone d'affichage avec 3 graphiques (Série, ACF, PACF)
+      par(mfrow = c(3, 1), mar = c(4, 4, 2, 1))
+      
+      # A. Graphique de la série
+      plot(y, type = "l", col = "blue", main = paste("Variable :", var), ylab = "Valeur")
+      
+      # B. ACF
+      acf(y, main = paste("ACF -", var), lag.max = 12)
+      
+      # C. PACF
+      pacf(y, main = paste("PACF -", var), lag.max = 12)
+      
+      # Remettre l'affichage à la normale après chaque variable
+      par(mfrow = c(1, 1))
+    }
+  }
+}
+```
+
+```{r}
+# ==============================
+# 5. Tests de stationnarité
+
+# Liste des variables logarithmiques
+
+# Créer une fonction pour tester ADF et KPSS
+
+test_stationarite <- function(serie, nom_var) {
+  
+  serie <- na.omit(serie)
+  
+  adf_p  <- adf.test(serie)$p.value
+  kpss_p <- kpss.test(serie, null = "Level")$p.value
+  
+  conclusion <- ifelse(adf_p < 0.05 & kpss_p > 0.05,
+                       "Stationnaire",
+                       "Non stationnaire")
+  
+  data.frame(
+    variable = nom_var,
+    ADF_pvalue = round(adf_p, 4),
+    KPSS_pvalue = round(kpss_p, 4),
+    conclusion = conclusion
+  )
+}
+ 
+
+# Exécuter les tests pour chaque variable
+
+stationarity_table <- bind_rows(
+  lapply(vars_num, function(v)
+    test_stationarite(data_ts[[v]], v))
+)
+
+stationarity_table
+
+```
+```{r}
+# Ordre de différenciation de toutes les variables 
+order_integration <- function(serie, nom_var, max_diff = 2) {
+  
+  serie <- na.omit(serie)
+  
+  for (d in 0:max_diff) {
+    test <- adf.test(serie)
+    
+    if (test$p.value < 0.05) {
+      return(data.frame(
+        variable = nom_var,
+        ordre_integration = paste0("I(", d, ")")
+      ))
+    }
+    
+    serie <- diff(serie)
+  }
+  
+  data.frame(
+    variable = nom_var,
+    ordre_integration = paste0("I(>", max_diff, ")")
+  )
+}
+
+integration_order <- bind_rows(
+  lapply(vars_num, function(v)
+    order_integration(data_ts[[v]], v))
+)
+integration_order
+```
+Toutes les variables ne sont pas staionnaire à niveau. Pour les rendre stationnaire il faut les différencier et selon les calcules toutes une seule fois. Toutefois nous allons différencier et vérifier encore la staionnarité
+```{r}
+ 
+# Différencier toutes les colonnes une seule fois 
+var_diff <- data_ts %>% dplyr:: select(
+    "inflation", "Importations",
+  "masse_monetaireM2","Taux_change_usd","taux_directeur"
+)
+
+df_diff <- data_ts %>%
+  mutate(across(
+    where(is.numeric),
+    ~ c(NA, diff(.)),
+    .names = "{.col}_diff"
+  )) %>% dplyr:: select(periode, ends_with("_diff")) %>%drop_na()
+
+df_diff
+
+```
+
+
+```{r}
+
+# Vérification de la stationnarité
+for (col in colnames(df_diff)) {
+  cat("\nVariable:", col, "\n")
+  
+  # Test ADF (stationnarité si rejet de H0)
+  adf_result <- adf.test(df_diff[[col]], alternative = "stationary")
+  print(adf_result)
+  
+  # Test KPSS (stationnarité si non rejet de H0)
+  kpss_result <- kpss.test(df_diff[[col]], null = "Level")
+  print(kpss_result)
+}
+ 
+# Suppression de la variable période et changement en df car VARselect n'accepte pas tsibble
+  # on enlève la date
+ 
+var_df <- df_diff[,-1] %>% as.data.frame()
+```
+
+
+```{r}
+# Choix du nombre de retards (LAGS)
+p <- VARselect(var_df, lag.max = 12, type = "const")
+p_opt <- p$selection["AIC(n)"]
+p_opt
+# Selection des variables pertinentes 
+# correlation 
+GGally::ggpairs(as.data.frame(var_df[,2:5]))
+```
+
+Mon étude avait comme objectif determiner les facteurs de l'inflation et faire aussi de prévisions en combinant les modèles économérique et de machine learning.
+choix du modèle 
+Le modèle VAR/VECM sont de bons modèles qui sont utilisés en économétrie pour modéliser les relations et des prévisions. En se referant sur les stat descriptives, les séries sont plutôt volatiles et connaissent des chocs. Pas de tendance claire et une saisonnalité plutôt complexe.
+Avant de choisir le modèle adequat VAR ou VECM il faut faire un test de cointégration pour voir si les variables ont une relation à long terme ou non ou bien si elles ne sont pas stationnaire au même ordre de différenciation.
+
+Cette première partie va constituer l'estimation du modèle explicatif pour voir les relations et les effets des autres séries sur l'inflation
+
+```{r}
+#===========================================================================
+##                         MODELE EXPLICATIF
+#===========================================================================
+### Choix du modèle VAR ou VECM
+# test de  cointégration de Johensen
+  
+is.numeric(var_df)
+sapply(as.data.frame(var_df), is.numeric) 
+
+jo_test <- ca.jo(var_df, type = "trace", ecdet = "const", K = 12 + 1)
+summary(jo_test)  # r = 0 alors pas de relation à long terme 
+```
+Suite à ce test, les séries n'ont pas une relation à long terme et donc ne sont pas cointégrées. Elles sont stationnaire au même ordre et donc le modèle qui sera estimé est le VAR
+
+```{r}
+# Estimation du modèle VAR 
+ 
+model <- VAR(var_df, p = p_opt, type = "const")
+ 
+
+```
+
+```{r}
+# vérification du nombre d'équation et leur nom
+length(model$varresult)
+names(model$varresult)
+```
+```{r}
+# Afficher l'équation avec l'inflation
+infl_eq <- model$varresult[[ "inflation_diff" ]]
+summary(infl_eq)
+```
+```{r}
+# Diagnostic du modèle 
+# Autocorrélation avec le test de Ljung-Box
+serial.test(model, lags.pt = 12, type = "PT.asymptotic")
+
+residu <- residuals(model)
+
+options(scipen = 999)
+mean(residu)
+acf(residu[, "inflation_diff"],
+    main = "ACF des résidus - Inflation (VAR)")
+
+pacf(residu[, "inflation_diff"],
+    main = "PACF des résidus - Inflation (VAR)")
+
+```
+
+
+```{r}
+
+# Normalité
+normality.test(model)
+
+# Hétéroscédasticité
+arch.test(model, lags.multi = 5)
+```
+```{r}
+# Test de stabilité
+ 
+# Calcul des racines inverses
+roots_var <- roots(model)
+print(roots_var)
+# Vérification de la stabilité
+if (all(Mod(roots_var) < 1)) {
+  print("Le modèle VAR est stable.")
+} else {
+  print("Le modèle VAR est instable.")
+}
+```
+```{r}
+plot(stability(model, type = "OLS-CUSUM"))
+
+```
+
+Un modèle VAR est stable si et seulement si toutes les valeurs propres de la matrice compagnon ont un module strictement inférieur à l’unité. La présence de racines égales ou supérieures à un implique une dynamique explosive ou persistante, rendant le modèle inapte à l’analyse dynamique et aux prévisions.
+Bien que les tests de stabilité structurelle (CUSUM) n’indiquent pas de rupture des coefficients, l’analyse des racines de la matrice compagnon révèle la présence de valeurs propres supérieures ou égales à l’unité. Cela implique une instabilité dynamique du système, rendant le VAR inapproprié pour l’analyse des mécanismes de transmission et les prévisions.
+Par conséquent le modèle adequat suite à l'échantillon petite est le modèle ARDL pour l'explication.
+
+### Modèle ARDL 
+```{r}
+# inflation ~ masse monétaire + taux de change
+library(ARDL)
+
+data_ts <- data_ts %>%
+  mutate(
+    log_M2 = log(masse_monetaireM2),
+    log_TC = log(Taux_change_usd),
+    log_Imp = log(Importations)
+  )
+```
+
+```{r}
+ardl_model <- auto_ardl(
+  inflation ~ log_M2 + log_TC + taux_directeur + log_Imp,
+  data  = data_ts,
+  max_order = 6,
+  selection = "AIC"# inflation, M2, taux de change
+  )
+ 
+# Voir le nombre de lags à partir d'AIC
+ardl_model$top_orders
+
+# Selection du meilleur modèle
+model_ardl <- ardl_model$best_model
+summary(model_ardl)
+```
+
+```{r}
+# Diagnostic du modèle 
+# Récupération des résidus 
+resi <- residuals(model_ardl)
+
+options(scipen = 999)
+mean(resi)
+
+# Test de normalité des résidus
+jarque.bera.test(resi)
+shapiro.test(resi)
+
+# Auotocorrelation 
+acf(resi)
+pacf(resi)
+
+# Test de durbin whatson 
+dwtest(model_ardl)
+```
+Suite au diagnostic de ce modèle, Les résidus suivent une loi normal, ne sont pas autocorelé et sont constants. Donc le modèle peut être utilisé pour expliquer les phénomènes liées à l'inflation du Sénégal.
+
+## Model de prévision 
+### Combinaison des modèles de machine learning et économique moderne
+ 
+
+
+### Modèle de machine learning
+
+```{r}
+vars <- c(
+  "inflation_diff",
+  "masse_monetaireM2_diff",
+  "Importations_diff",
+  "Taux_change_usd_diff",
+  "taux_directeur_diff"
+)
+```
+
+```{r}
+# Une base de données avec les variables du modèle et le retard à considérer
+ml_df <- df_diff %>%
+  mutate(
+    # inflation lags
+    infl_lag1 = lag(inflation_diff, 1),
+    infl_lag2 = lag(inflation_diff, 2),
+    
+    # masse monétaire
+    m2_lag1 = lag(masse_monetaireM2_diff, 1),
+    m2_lag2 = lag(masse_monetaireM2_diff, 2),
+    
+    # taux de change
+    tc_lag1 = lag(Taux_change_usd_diff, 1),
+    tc_lag2 = lag(Taux_change_usd_diff, 2),
+    
+    # importations
+    imp_lag1 = lag(Importations_diff, 1),
+    imp_lag2 = lag(Importations_diff, 2),
+    
+    # taux directeur
+    td_lag1 = lag(taux_directeur_diff, 1),
+    td_lag2 = lag(taux_directeur_diff, 2)
+  ) %>%
+  drop_na()
+```
+
+#### Random forest
+
+```{r}
+# Partage de la base en train et en test 
+train_ml <- ml_df %>% filter(periode <= yearmonth("2023 dec"))
+test_ml  <- ml_df %>% filter(periode > yearmonth("2023 dec"))
+
+X_train <- train_ml[, c(-1, -2)]
+y_train <- train_ml$inflation_diff
+
+X_test <- test_ml[, c(-1, -2)]
+y_test <- test_ml$inflation_diff
+```
+
+```{r}
+# Estimation du modèle 
+set.seed(123)
+
+rf_model <- randomForest(
+  x = X_train,
+  y = y_train,
+  ntree = 500,
+  mtry = floor(sqrt(ncol(X_train))),
+  importance = TRUE
+)
+```
+
+```{r}
+# Prévision
+rf_pred <- predict(rf_model, X_test)
+
+```
+
+```{r}
+# Calcule des métriques 
+ml_metrics <- function(y_true, y_pred) {
+  data.frame(
+    RMSE = sqrt(mean((y_true - y_pred)^2)),
+    MAE = mean(abs(y_true - y_pred)),
+    Theil_U = sqrt(mean((y_pred - y_true)^2)) /
+      sqrt(mean(diff(y_true)^2))
+  )
+}
+metrics_RF <- ml_metrics(y_test, rf_pred)
+metrics_RF
+```
+
+#### Modèle xgboost
+
+```{r}
+# Ensemble test et train 
+X_train_num <- X_train %>% dplyr:: select(where(is.numeric))
+X_test_num  <- X_test  %>% dplyr:: select(where(is.numeric))
+
+dtrain <- xgb.DMatrix(
+  data = as.matrix(X_train_num),
+  label = y_train
+)
+
+dtest <- xgb.DMatrix(
+  data = as.matrix(X_test_num),
+  label = y_test
+)
+```
+
+```{r}
+# Estimation du modèle
+xgb_model <- xgboost(
+  data = dtrain,
+  objective = "reg:squarederror",
+  nrounds = 300,
+  eta = 0.05,
+  max_depth = 4,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  verbose = 0
+)
+```
+
+```{r}
+# Prévisions
+xgb_pred <- predict(xgb_model, dtest)
+
+# Calcule des métriques
+metrics_XGB <- ml_metrics(y_test, xgb_pred)
+metrics_XGB
+
+```
+
+### Comparaison des trois modèles
+
+```{r}
+# Data frame pour stocker les métriques de différents modèles
+metriq <- data.frame(
+  metrics_RF,
+  metrics_XGB
+)
+```
+
+
+```{r}
+# Data frame pour stocker les différents prévisions des modèles et les vrais valeurs
+
+ml_plot_df <- data.frame(
+  date = test_ml$periode,
+  inflation_reelle = y_test,
+  inflation_RF = rf_pred,
+  inflation_XGB = xgb_pred
+)
+```
+
+```{r}
+# Graphique pour comparer les modèles 
+
+ggplot(ml_plot_df, aes(x = date)) +
+  geom_line(aes(y = inflation_reelle, color = "Réelle"), linewidth = 1) +
+  geom_line(aes(y = inflation_RF, color = "Random Forest")) +
+  geom_line(aes(y = inflation_XGB, color = "XGBoost")) +
+  scale_color_manual(values = c("black", "blue", "red", "green")) +
+  theme_minimal() +
+  labs(
+    title = "Prévisions de l'inflation – modèles ML",
+    y = "Inflation (différenciée)",
+    color = ""
+  )
+```
+
+
+### Modèle de série temporelle (Prévisions de l'inflation à partir de ses valeurs passées)
+
+#### Modèle ARIMA
+
+```{r}
+# Crétion de la série 
+infl_ts <- ts(
+  df_diff$inflation_diff,
+  frequency = 12   # mensuel
+)
+
+n_test <- length(y_test)
+```
+
+```{r}
+# Ensemble train et test
+infl_train <- head(infl_ts, length(infl_ts) - n_test)
+infl_test  <- tail(infl_ts, n_test)
+```
+
+```{r}
+# Estimation du modèle
+arima_model <- auto.arima(
+  infl_train,
+  seasonal = FALSE,
+  stepwise = FALSE,
+  approximation = FALSE
+)
+
+summary(arima_model)
+```
+
+```{r}
+# Prévisions  
+arima_fcst <- forecast(arima_model, h = n_test)
+arima_pred <- as.numeric(arima_fcst$mean)
+
+# Métriques
+metrics_ARIMA  <- ml_metrics(infl_test, arima_pred)
+```
+
+#### Modèle Sarima
+
+```{r}
+# Estimation du modèle
+sarima_model <- auto.arima(
+  infl_train,
+  seasonal = TRUE,
+  stepwise = FALSE,
+  approximation = FALSE
+)
+
+summary(sarima_model)
+
+
+```
+
+```{r}
+# Prévisions 
+sarima_fcst <- forecast(sarima_model, h = n_test)
+sarima_pred <- as.numeric(sarima_fcst$mean)
+
+# Métriques
+metrics_SARIMA <- ml_metrics(infl_test, sarima_pred)
+```
+
+```{r}
+# Comparaisons des métriques 
+metrics_ARIMA
+metrics_SARIMA
+```
+
+```{r}
+# Data frame des prévions des modèles de série temporelle et XGboost
+ml_plot_dt <- data.frame(
+  date = test_ml$periode,
+  inflation_reelle = y_test,
+  inflation_XGB = xgb_pred,
+  inflation_arima = arima_pred,
+  inflation_sarima = sarima_pred
+)
+```
+
+```{r}
+# Graphique 
+ggplot(ml_plot_dt, aes(x = date)) +
+  geom_line(aes(y = inflation_reelle, color = "Réelle"), linewidth = 1) +
+  geom_line(aes(y = inflation_arima, color = "Prévision Arima")) +
+  geom_line(aes(y = inflation_sarima, color = "Prévision SArima")) +
+  geom_line(aes(y = inflation_XGB, color = "XGBoost")) +
+  scale_color_manual(values = c("black", "blue", "red", "green")) +
+  theme_minimal() +
+  labs(
+    title = "Prévisions de l'inflation – modèles ML",
+    y = "Inflation (différenciée)",
+    color = ""
+  )
+```
+
+
+
+
+```{r}
+saveRDS(data_ts, "data/data_ts.rds")
+
+saveRDS(model_ardl, "data/ardl_model.rds")
+saveRDS(xgb_model, "data/xgb_model.rds")
+saveRDS(sarima_model, "data/sarima_model.rds")
+
+```
+
+```{r}
+metrics_df <- data.frame(
+  Modele = c("XGBoost", "SARIMA"),
+  RMSE   = c(1.08, 0.82),
+  MAE    = c(0.89, 0.65),
+  TheilU = c(0.88, 0.67)
+)
+
+saveRDS(metrics_df, "data/metrics_df.rds")
+saveRDS(ml_plot_dt, "data/ml_plot_dt.rds")
+
+```
+
+
+
+
+Le modèle ARDL (Autoregressif à retard echelonné)
+est un modèle qui est adequat lorsque les séries ne sont pas intégré 
+de même ordre.
+
+
+
